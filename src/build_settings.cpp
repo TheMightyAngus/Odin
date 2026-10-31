@@ -26,6 +26,7 @@ enum TargetOsKind : u16 {
 	TargetOs_orca,
 
 	TargetOs_freestanding,
+	TargetOs_murk,
 
 	TargetOs_COUNT,
 };
@@ -44,6 +45,7 @@ gb_global String target_os_names[TargetOs_COUNT] = {
 	str_lit("orca"),
 
 	str_lit("freestanding"),
+	str_lit("murk"),
 };
 
 enum TargetArchKind : u16 {
@@ -321,6 +323,7 @@ enum VetFlags : u64 {
 	VetFlag_NilDeref        = 1u<<13,
 	VetFlag_Uninitialized   = 1u<<14,
 	VetFlag_AtomicAccess    = 1u<<15,
+	VetFlag_LargeMoves      = 1u<<16, // Murk Stack: opt-in, never part of VetFlag_All (-vet-large-moves)
 
 	VetFlag_Unused = VetFlag_UnusedVariables|VetFlag_UnusedImports,
 
@@ -381,9 +384,17 @@ u64 get_vet_flag_from_name(String const &name) {
 		return VetFlag_Uninitialized;
 	} else if (name == "atomic-access") {
 		return VetFlag_AtomicAccess;
+	} else if (name == "large-moves") {
+		return VetFlag_LargeMoves;
 	}
 	return VetFlag_NONE;
 }
+
+// Murk Stack (-vet-large-moves): a value larger than this many bytes is reported when it moves through a multiple
+// assignment or a ternary, which lower it to one first-class LLVM aggregate that the optimiser can spin on forever.
+// 1 KiB: the two hangs found (a [256]Zone of 26624 bytes, a 128-entity Snapshot_Payload of 15376 bytes) are 15 to 26
+// times over it, and a fixed array of bytes this size is already about the thousand scalars where the hangs begin.
+enum : i64 { VET_LARGE_MOVES_DEFAULT_THRESHOLD = 1024 };
 
 enum OptInFeatureFlags : u64 {
 	OptInFeatureFlag_NONE            = 0,
@@ -553,6 +564,7 @@ struct BuildContext {
 	String pdb_filepath;
 
 	u64 vet_flags;
+	i64 vet_large_moves_threshold; // bytes; 0 means VET_LARGE_MOVES_DEFAULT_THRESHOLD
 	u32 sanitizer_flags;
 	StringSet vet_packages;
 	StringSet strict_style_packages;
@@ -914,6 +926,14 @@ gb_global TargetMetrics target_freestanding_amd64_sysv = {
 	TargetABI_SysV,
 };
 
+gb_global TargetMetrics target_murk_amd64 = {
+	TargetOs_murk,
+	TargetArch_amd64,
+	8, 8, AMD64_MAX_ALIGNMENT, 512,
+	str_lit("x86_64-pc-none-gnu"),
+	TargetABI_SysV,
+};
+
 gb_global TargetMetrics target_freestanding_amd64_win64 = {
 	TargetOs_freestanding,
 	TargetArch_amd64,
@@ -989,6 +1009,7 @@ gb_global NamedTargetMetrics named_targets[] = {
 	{ str_lit("wasi_wasm64p32"),         &target_wasi_wasm64p32 },
 
 	{ str_lit("freestanding_amd64_sysv"),  &target_freestanding_amd64_sysv },
+	{ str_lit("murk_amd64"),               &target_murk_amd64 },
 	{ str_lit("freestanding_amd64_win64"), &target_freestanding_amd64_win64 },
 	{ str_lit("freestanding_amd64_mingw"), &target_freestanding_amd64_mingw },
 

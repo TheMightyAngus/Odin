@@ -65,8 +65,27 @@ stop_runner_callback :: proc "system" (ctrl_type: win32.DWORD) -> win32.BOOL  {
 	return false
 }
 
-@(private)
-stop_test_callback :: proc "system" (info: ^win32.EXCEPTION_POINTERS) -> win32.LONG {
+// How a test is stopped on Windows (Murk Stack patch, 3 October 2026).
+//
+// A test is stopped only for an exception that nobody handles, seen by the
+// process's unhandled-exception filter. A vectored handler would see every
+// exception at first chance, including ones a library raises and catches as
+// part of its work (a GPU driver's C++ throw while creating its device, a
+// guarded probe of memory), and stopping the test for those is wrong. A
+// debugger attached to the process sees unhandled exceptions before the
+// filter, as it should.
+//
+// The C runtime's signals are caught too, as the POSIX runner does:
+// libc.raise(SIGILL) and the like go to the C runtime's handlers, not to the
+// filter, and its default action ends the process.
+//
+// Either way, the failing thread records why it stopped and then idles, still
+// holding stop_test_gate, until the runner terminates it (thread.pool_stop_task)
+// and releases the gate (_should_stop_test). Returning from the filter would let
+// the exception end the whole process before the runner got to the thread.
+
+@(private="file")
+stop_test_filter :: proc "system" (info: ^win32.EXCEPTION_POINTERS) -> win32.LONG {
 	if !local_test_index_set {
 		// We're a thread created by a test thread.
 		//
@@ -76,14 +95,33 @@ stop_test_callback :: proc "system" (info: ^win32.EXCEPTION_POINTERS) -> win32.L
 	}
 
 	context = runtime.default_context()
-	code := info.ExceptionRecord.ExceptionCode
-	if code < 0x8000_0000 {
-		// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-erref/87fba13e-bf06-450e-83b1-9241dc81e781
-		// Ignore informational status codes
-		return win32.EXCEPTION_CONTINUE_SEARCH
+	stop_test(info.ExceptionRecord.ExceptionCode)
+}
+
+// The C runtime's signal handler, mapped to the exception the signal stands for.
+@(private="file")
+stop_test_signal_callback :: proc "c" (sig: libc.int) {
+	context = runtime.default_context()
+	code: win32.DWORD
+	switch sig {
+	case libc.SIGILL:  code = win32.EXCEPTION_ILLEGAL_INSTRUCTION
+	case libc.SIGSEGV: code = win32.EXCEPTION_ACCESS_VIOLATION
+	case libc.SIGFPE:  code = win32.EXCEPTION_FLT_INVALID_OPERATION
+	case:              return
 	}
+	if !local_test_index_set {
+		// A thread a test made: the default action, as without the runner.
+		libc.signal(sig, cast(proc "c" (libc.int))libc.SIG_DFL)
+		libc.raise(sig)
+		return
+	}
+	stop_test(code)
+}
 
-
+// Records why the current test thread stops and idles until the runner ends
+// it. On the runner's own thread there is no recovery: the process ends.
+@(private="file")
+stop_test :: proc(code: win32.DWORD) -> ! {
 	if local_test_index == -1 {
 		// We're the test runner, and we ourselves have caught a signal from
 		// which there is no recovery.
@@ -115,48 +153,51 @@ This is a dire bug and should be reported to the Odin developers.
 		os.flush(os.stderr)
 
 		win32.TerminateProcess(win32.GetCurrentProcess(), 1)
+		for {
+			win32.Sleep(win32.INFINITE)
+		}
 	}
 
-	if sync.mutex_guard(&stop_test_gate) {
-		intrinsics.atomic_store(&stop_test_index, local_test_index)
-		intrinsics.atomic_store(&stop_test_signal, code)
-		passed: bool
-		check_passing: {
-			if location := local_test_assertion_raised.location; location != {} {
-				for i in 0..<local_test_expected_failures.location_count {
-					if local_test_expected_failures.locations[i] == location {
-						passed = true
-						break check_passing
-					}
-				}
-			}
-			if message := local_test_assertion_raised.message; message != "" {
-				for i in 0..<local_test_expected_failures.message_count {
-					if local_test_expected_failures.messages[i] == message {
-						passed = true
-						break check_passing
-					}
-				}
-			}
-			signal := local_test_expected_failures.signal
-			switch signal {
-			case libc.SIGILL:  passed = code == win32.EXCEPTION_ILLEGAL_INSTRUCTION || code == win32.EXCEPTION_ARRAY_BOUNDS_EXCEEDED
-			case libc.SIGSEGV: passed = code == win32.EXCEPTION_ACCESS_VIOLATION
-			case libc.SIGFPE:
-				switch code {
-				case win32.EXCEPTION_FLT_DENORMAL_OPERAND ..= win32.EXCEPTION_INT_OVERFLOW:
+	sync.mutex_lock(&stop_test_gate)
+	intrinsics.atomic_store(&stop_test_index, local_test_index)
+	intrinsics.atomic_store(&stop_test_signal, code)
+	passed: bool
+	check_passing: {
+		if location := local_test_assertion_raised.location; location != {} {
+			for i in 0..<local_test_expected_failures.location_count {
+				if local_test_expected_failures.locations[i] == location {
 					passed = true
+					break check_passing
 				}
 			}
 		}
-		intrinsics.atomic_store(&stop_test_passed, passed)
-		intrinsics.atomic_store(&stop_test_alert, 1)
-
+		if message := local_test_assertion_raised.message; message != "" {
+			for i in 0..<local_test_expected_failures.message_count {
+				if local_test_expected_failures.messages[i] == message {
+					passed = true
+					break check_passing
+				}
+			}
+		}
+		signal := local_test_expected_failures.signal
+		switch signal {
+		case libc.SIGILL:  passed = code == win32.EXCEPTION_ILLEGAL_INSTRUCTION || code == win32.EXCEPTION_ARRAY_BOUNDS_EXCEEDED
+		case libc.SIGSEGV: passed = code == win32.EXCEPTION_ACCESS_VIOLATION
+		case libc.SIGFPE:
+			switch code {
+			case win32.EXCEPTION_FLT_DENORMAL_OPERAND ..= win32.EXCEPTION_INT_OVERFLOW:
+				passed = true
+			}
+		}
 	}
+	intrinsics.atomic_store(&stop_test_passed, passed)
+	intrinsics.atomic_store(&stop_test_alert, 1)
 
-	// Pass on the exeption to the next handler. As we don't wont to recover from it.
-	// This also allows debuggers handle it properly.
-	return win32.EXCEPTION_CONTINUE_SEARCH
+	for {
+		// Idle until this thread is terminated by the runner, which then
+		// releases stop_test_gate.
+		win32.Sleep(win32.INFINITE)
+	}
 }
 
 _setup_signal_handler :: proc() {
@@ -167,17 +208,25 @@ _setup_signal_handler :: proc() {
 	win32.SetConsoleCtrlHandler(stop_runner_callback, win32.TRUE)
 
 	// For tests:
-	// Catch the following:
+	// Catch the following, when nothing handles them:
 	// - Asserts and panics;
 	// - Out of Bounds exeptions;
 	// - Arithmetic errors; and
 	// - Segmentation faults (illegal memory access).
-	win32.AddVectoredExceptionHandler(0, stop_test_callback)
+	win32.SetUnhandledExceptionFilter(stop_test_filter)
+	// And the C runtime's signals for the same.
+	libc.signal(libc.SIGILL, stop_test_signal_callback)
+	libc.signal(libc.SIGFPE, stop_test_signal_callback)
+	libc.signal(libc.SIGSEGV, stop_test_signal_callback)
 }
 
 _setup_task_signal_handler :: proc(test_index: int) {
 	local_test_index = test_index
 	local_test_index_set = true
+	// The C runtime keeps SIGILL, SIGFPE and SIGSEGV handlers per thread.
+	libc.signal(libc.SIGILL, stop_test_signal_callback)
+	libc.signal(libc.SIGFPE, stop_test_signal_callback)
+	libc.signal(libc.SIGSEGV, stop_test_signal_callback)
 }
 
 _should_stop_runner :: proc() -> bool {

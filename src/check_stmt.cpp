@@ -2599,6 +2599,8 @@ gb_internal void check_assign_stmt(CheckerContext *ctx, Ast *node) {
 		}
 		if (lhs_count != rhs_count) {
 			error(as->lhs[0], "Assignment count mismatch '%td' = '%td'", lhs_count, rhs_count);
+		} else {
+			vet_large_moves_multiple_assignment(ctx, as->lhs, as->rhs);
 		}
 
 	} else {

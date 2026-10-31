@@ -4,6 +4,7 @@
 #+build !windows
 #+build !netbsd
 #+build !openbsd
+#+build !murk
 #+private
 package net
 

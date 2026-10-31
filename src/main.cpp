@@ -465,6 +465,7 @@ enum BuildFlagKind {
 	BuildFlag_VetNilDeref,
 	BuildFlag_VetUninitialized,
 	BuildFlag_VetAtomicAccess,
+	BuildFlag_VetLargeMoves,
 	BuildFlag_VetPackages,
 
 	BuildFlag_CustomAttribute,
@@ -746,6 +747,7 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_VetNilDeref,             str_lit("vet-nil-deref"),             BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_VetUninitialized,        str_lit("vet-uninitialized"),         BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_VetAtomicAccess,         str_lit("vet-atomic-access"),         BuildFlagParam_None,    Command__does_check);
+	add_flag(&build_flags, BuildFlag_VetLargeMoves,           str_lit("vet-large-moves"),           BuildFlagParam_Integer, Command__does_check);
 	add_flag(&build_flags, BuildFlag_VetPackages,             str_lit("vet-packages"),              BuildFlagParam_String,  Command__does_check);
 
 	add_flag(&build_flags, BuildFlag_CustomAttribute,         str_lit("custom-attribute"),          BuildFlagParam_String,  Command__does_check, true);
@@ -898,7 +900,12 @@ gb_internal bool parse_build_flags(Array<String> args) {
 				} else {
 					ExactValue value = {};
 					bool ok = false;
-					if (bf.param_kind == BuildFlagParam_None) {
+					BuildFlagParamKind param_kind = bf.param_kind;
+					if (bf.kind == BuildFlag_VetLargeMoves && param.len == 0) {
+						// Murk Stack: `-vet-large-moves` alone takes the default threshold
+						param_kind = BuildFlagParam_None;
+					}
+					if (param_kind == BuildFlagParam_None) {
 						if (param.len == 0) {
 							ok = true;
 						} else {
@@ -910,7 +917,7 @@ gb_internal bool parse_build_flags(Array<String> args) {
 						bad_flags = true;
 					} else {
 						ok = true;
-						switch (bf.param_kind) {
+						switch (param_kind) {
 						default: {
 							ok = false;
 						} break;
@@ -946,7 +953,7 @@ gb_internal bool parse_build_flags(Array<String> args) {
 						}
 					}
 					if (ok) {
-						switch (bf.param_kind) {
+						switch (param_kind) {
 						case BuildFlagParam_None:
 							if (value.kind != ExactValue_Invalid) {
 								gb_printf_err("%.*s expected no value, got %.*s\n", LIT(name), LIT(param));
@@ -1574,6 +1581,19 @@ gb_internal bool parse_build_flags(Array<String> args) {
 						case BuildFlag_VetUninitialized:    build_context.vet_flags |= VetFlag_Uninitialized;    break;
 						case BuildFlag_VetAtomicAccess:     build_context.vet_flags |= VetFlag_AtomicAccess;     break;
 						case BuildFlag_VetUnusedProcedures: build_context.vet_flags |= VetFlag_UnusedProcedures; break;
+
+						case BuildFlag_VetLargeMoves:
+							build_context.vet_flags |= VetFlag_LargeMoves;
+							if (value.kind == ExactValue_Integer) {
+								i64 threshold = big_int_to_i64(&value.value_integer);
+								if (threshold <= 0) {
+									gb_printf_err("-%.*s expected a positive number of bytes, got %.*s\n", LIT(name), LIT(param));
+									bad_flags = true;
+								} else {
+									build_context.vet_large_moves_threshold = threshold;
+								}
+							}
+							break;
 
 						case BuildFlag_VetPackages:
 							{
@@ -3689,6 +3709,13 @@ gb_internal int print_show_help(String const arg0, String command, String option
 		if (print_flag("-vet-nil-deref")) {
 			print_usage_line(2, "Errs on dereferencing a pointer, or calling a procedure value, which is nil on every path reaching it.");
 			print_usage_line(2, "A pointer made through an explicit conversion to 'rawptr' or 'uintptr', or a 'transmute', is never assumed to be nil.");
+		}
+
+		if (print_flag("-vet-large-moves[:<integer>]")) {
+			print_usage_line(2, "Warns when a value larger than the given number of bytes (default 1024) moves through a");
+			print_usage_line(2, "multiple assignment (`a, b = x, y`) or a ternary (`x if c else y`, `c ? x : y`).");
+			print_usage_line(2, "Both lower the value to one first-class LLVM aggregate, which the optimiser can spin on forever;");
+			print_usage_line(2, "a single assignment copies it with memcpy. Not part of -vet. Per file: `#+vet large-moves`.");
 		}
 
 		if (print_flag("-vet-packages:<comma-separated-strings>")) {

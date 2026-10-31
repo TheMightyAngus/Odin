@@ -20,7 +20,7 @@ if "%VSCMD_ARG_TGT_ARCH%" neq "x64" (
 )
 
 where /Q git.exe || goto skip_git_hash
-if not exist .git\ goto skip_git_hash
+if not exist .git\ if not exist .git goto skip_git_hash
 for /f "tokens=1,2" %%i IN ('git -c "log.showSignature=false" show "--pretty=%%cd %%h" "--date=format:%%Y-%%m-%%d" --no-patch --no-notes HEAD') do (
 	set CURR_DATE_TIME=%%i
 	set GIT_SHA=%%j
@@ -43,6 +43,7 @@ set curr_day=%CURR_DATE_TIME:~8,2%
 
 :: Make sure this is a decent name and not generic
 set exe_name=odin.exe
+if not "%ODIN_EXE_NAME%" == "" set exe_name=%ODIN_EXE_NAME%
 
 :: Debug = 0, Release = 1
 if "%1" == "1" (

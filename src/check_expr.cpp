@@ -10996,6 +10996,94 @@ gb_internal void check_expr_as_value_for_ternary(CheckerContext *c, Operand *o, 
 	}
 }
 
+// Murk Stack: -vet-large-moves. A multiple assignment (`a, b = x, y`, `a, b = f()`, `v, ok = m[k]`) and a ternary
+// (`x if c else y`) lower their values to first-class LLVM loads, stores, phis and selects; a large aggregate there can
+// make the optimiser spin forever, where a single assignment copies it with memcpy. A multiple declaration
+// (`a, b := x, y`) is not reported: lb_build_stmt stores each of its values with memcpy (checked in the IR, 18 October
+// 2026). Returns 0 when the check is off for this node's file.
+gb_internal i64 vet_large_moves_threshold(Ast *node) {
+	if ((check_vet_flags(node) & VetFlag_LargeMoves) == 0) {
+		return 0;
+	}
+	i64 threshold = build_context.vet_large_moves_threshold;
+	return threshold > 0 ? threshold : VET_LARGE_MOVES_DEFAULT_THRESHOLD;
+}
+
+// Zeroing (`{}`), `---` and constants are stored with memset or memcpy, whatever the statement.
+gb_internal bool vet_large_moves_is_exempt(Ast *expr) {
+	expr = unparen_expr(expr);
+	if (expr == nullptr || expr->tav.mode == Addressing_Constant) {
+		return true;
+	}
+	if (expr->kind == Ast_Uninit) {
+		return true;
+	}
+	return expr->kind == Ast_CompoundLit && expr->CompoundLit.elems.count == 0;
+}
+
+gb_internal void vet_large_move(CheckerContext *c, Ast *expr, Type *type, i64 threshold, char const *through, char const *advice) {
+	if (type == nullptr || type == t_invalid || is_type_untyped(type) || is_type_polymorphic(type)) {
+		return;
+	}
+	i64 size = type_size_of(type);
+	if (size <= threshold) {
+		return;
+	}
+	gbString expr_str = expr_to_string(expr);
+	gbString type_str = type_to_string(type);
+	if (c->proc_name.len > 0) {
+		warning(expr, "Large value moved through %s in procedure '%.*s': '%s' of type '%s' is %lld bytes (over %lld); %s",
+		        through, LIT(c->proc_name), expr_str, type_str, cast(long long)size, cast(long long)threshold, advice);
+	} else {
+		warning(expr, "Large value moved through %s at file scope: '%s' of type '%s' is %lld bytes (over %lld); %s",
+		        through, expr_str, type_str, cast(long long)size, cast(long long)threshold, advice);
+	}
+	gb_string_free(type_str);
+	gb_string_free(expr_str);
+}
+
+// `lhs` are the targets (blank identifiers are not stored), `rhs` the checked values: a call's results and the
+// comma-ok form `v, ok = m[k]` give more targets than values.
+gb_internal void vet_large_moves_multiple_assignment(CheckerContext *c, Slice<Ast *> const &lhs, Slice<Ast *> const &rhs) {
+	if (rhs.count == 0) {
+		return;
+	}
+	i64 threshold = vet_large_moves_threshold(rhs[0]);
+	if (threshold == 0) {
+		return;
+	}
+	isize stored = 0;
+	for (Ast *l : lhs) {
+		if (!is_blank_ident(l)) {
+			stored += 1;
+		}
+	}
+	if (stored < 2) {
+		return; // one target: a single store, copied with memcpy
+	}
+	char const *through = "a multiple assignment";
+	char const *advice = "give it its own assignment";
+	char const *advice_unpack = "receive the results in a declaration (':='), which copies with memcpy";
+	isize j = 0;
+	for (Ast *r : rhs) {
+		Type *t = type_of_expr(r);
+		if (t != nullptr && t->kind == Type_Tuple) {
+			for (Entity *v : t->Tuple.variables) {
+				if (j < lhs.count && !is_blank_ident(lhs[j]) && v != nullptr) {
+					vet_large_move(c, r, v->type, threshold, through, advice_unpack);
+				}
+				j += 1;
+			}
+			continue;
+		}
+		if (j < lhs.count && !is_blank_ident(lhs[j]) && !vet_large_moves_is_exempt(r)) {
+			// one value filling two targets is the comma-ok form `v, ok = m[k]`
+			vet_large_move(c, r, t, threshold, through, rhs.count < lhs.count ? advice_unpack : advice);
+		}
+		j += 1;
+	}
+}
+
 gb_internal ExprKind check_ternary_if_expr(CheckerContext *c, Operand *o, Ast *node, Type *type_hint) {
 	ExprKind kind = Expr_Expr;
 	Operand cond = {Addressing_Invalid};
@@ -11112,6 +11200,9 @@ gb_internal ExprKind check_ternary_if_expr(CheckerContext *c, Operand *o, Ast *n
 			update_untyped_expr_type(c, node, type_hint, !is_type_untyped(type_hint));
 			o->type = type_hint;
 		}
+	}
+	if (i64 threshold = vet_large_moves_threshold(node)) {
+		vet_large_move(c, node, o->type, threshold, "a ternary", "assign it in a plain 'if' instead");
 	}
 	return kind;
 }

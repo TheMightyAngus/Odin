@@ -4,6 +4,7 @@
 #+build !freebsd
 #+build !netbsd
 #+build !openbsd
+#+build !murk
 package net
 
 @(private)

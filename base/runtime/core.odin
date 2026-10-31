@@ -675,6 +675,7 @@ ALL_ODIN_OS_TYPES :: Odin_OS_Types{
 	.JS,
 	.Orca,
 	.Freestanding,
+	.Murk,
 }
 
 /*

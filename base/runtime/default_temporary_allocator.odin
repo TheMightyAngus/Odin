@@ -1,6 +1,9 @@
 package runtime
 
-DEFAULT_TEMP_ALLOCATOR_BACKING_SIZE: int : #config(DEFAULT_TEMP_ALLOCATOR_BACKING_SIZE, 4 * Megabyte)
+// On Murk a program's heap is its manifest budget, often 1024 pages: a 4 MiB
+// first block would make every temporary allocation fail there (27 September
+// 2026), so its arenas grow from 64 KiB blocks instead.
+DEFAULT_TEMP_ALLOCATOR_BACKING_SIZE: int : #config(DEFAULT_TEMP_ALLOCATOR_BACKING_SIZE, 64 * Kilobyte when ODIN_OS == .Murk else 4 * Megabyte)
 NO_DEFAULT_TEMP_ALLOCATOR: bool : ODIN_OS == .Freestanding || ODIN_DEFAULT_TO_NIL_ALLOCATOR
 
 when NO_DEFAULT_TEMP_ALLOCATOR {

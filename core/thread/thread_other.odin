@@ -1,4 +1,4 @@
-#+build js, wasi, orca
+#+build js, wasi, orca, murk
 package thread
 
 import "base:intrinsics"
